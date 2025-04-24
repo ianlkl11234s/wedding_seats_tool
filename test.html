@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>婚禮座位分配工具</title>
+  <!-- 依賴庫：PapaParse 解析 CSV、FileSaver 匯出 CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; }
+    section { margin-bottom: 20px; }
+    .table-row { margin-bottom: 5px; }
+    .table-row span { margin-right: 5px; }
+    .table-row input { width: 60px; margin-right: 5px; }
+    .table-row button { margin-left: 5px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+    table, th, td { border: 1px solid #ccc; }
+    th, td { padding: 8px; text-align: left; }
+    #unassigned p { margin: 4px 0; }
+    .warning { color: red; }
+  </style>
+</head>
+<body>
+  <h1>婚禮座位分配工具</h1>
+
+  <!-- 桌位設定區 -->
+  <section id="table-config">
+    <h2>桌位設定</h2>
+    <div id="tables"></div>
+    <button id="add-table">＋新增桌</button>
+  </section>
+
+  <!-- 賓客上傳與分配 -->
+  <section id="upload-assign">
+    <h2>賓客清單上傳與自動分配</h2>
+    <input type="file" id="guest-file" accept=".csv">
+    <button id="auto-assign">自動分配</button>
+  </section>
+
+  <!-- 分配結果展示 -->
+  <section id="results">
+    <h2>分配結果</h2>
+    <div id="assignments"></div>
+    <h3>未分配</h3>
+    <div id="unassigned"></div>
+  </section>
+
+  <!-- 匯出按鈕 -->
+  <button id="export-csv">下載 CSV</button>
+
+  <script>
+    // 全域資料結構
+    let guests = [];
+    const tables = []; // { id, capacity, assigned: [guestId1, guestId2, ...] }
+    const guestMap = {}; // { guestId: guestObject }
+
+    // 桌位設定 DOM
+    const tablesDiv = document.getElementById('tables');
+    function renderTablesConfig() {
+      tablesDiv.innerHTML = '';
+      tables.forEach((t, idx) => {
+        const div = document.createElement('div');
+        div.className = 'table-row';
+        div.innerHTML = `
+          <span>桌 ${t.id}</span>
+          <input type="number" min="1" value="${t.capacity}" data-idx="${idx}" class="table-capacity">
+          <button data-idx="${idx}" class="remove-table">－</button>
+        `;
+        tablesDiv.appendChild(div);
+      });
+    }
+    function addTable() {
+      // 確保新桌子的 ID 是唯一的，即使中間有刪除
+      const maxId = tables.reduce((max, t) => Math.max(max, t.id), 0);
+      const newId = maxId + 1;
+      tables.push({ id: newId, capacity: 6, assigned: [] });
+      renderTablesConfig();
+    }
+    document.getElementById('add-table').onclick = () => addTable();
+    tablesDiv.addEventListener('click', e => {
+      if (e.target.classList.contains('remove-table')) {
+        const idx = parseInt(e.target.dataset.idx);
+         // 找到實際要刪除的 table 物件，而不是依賴索引
+        const tableToRemove = tables.find((t, i) => i === idx);
+        if (tableToRemove) {
+            const tableIdToRemove = tableToRemove.id;
+            // 從 tables 陣列中移除
+            tables.splice(idx, 1);
+             // 如果有賓客被分配到這個桌子，將他們移回未分配狀態（雖然通常在分配前設定桌子）
+            guests.forEach(g => {
+                if (g.assignedTable === tableIdToRemove) {
+                    delete g.assignedTable;
+                }
+            });
+            // TODO: 可能需要觸發一次重新分配或至少更新顯示
+            renderTablesConfig();
+            // 需要重新渲染結果區，因為桌子沒了，分配也可能需要調整
+            renderResults(getUnassignedGuestIds()); // 顯示當前的未分配狀態
+        }
+      }
+    });
+    tablesDiv.addEventListener('input', e => {
+      if (e.target.classList.contains('table-capacity')) {
+        const idx = e.target.dataset.idx;
+         // 確保使用正確的索引找到對應的 table
+        const tableToUpdate = tables.find((t, i) => i === parseInt(idx));
+         if (tableToUpdate) {
+             tableToUpdate.capacity = parseInt(e.target.value) || 0;
+             // 容量變更後，可能需要重新評估顯示狀態
+             renderResults(getUnassignedGuestIds()); // 重新渲染以更新顏色狀態
+         }
+      }
+    });
+    // 初始化預設桌數（例如 22 張）
+    for (let i = 0; i < 22; i++) addTable(); // 初始改為 22 張
+
+    // 讀取賓客 CSV
+    document.getElementById('guest-file').addEventListener('change', function() {
+      const file = this.files[0];
+       // 重置狀態
+       guests = [];
+       tables.forEach(t => t.assigned = []);
+       Object.keys(guestMap).forEach(key => delete guestMap[key]); // 清空 guestMap
+
+      Papa.parse(file, {
+        header: true,
+        skipEmptyLines: true,
+        complete: results => {
+          guests = results.data
+            .filter(r => r['姓名'] && r['姓名'].trim() !== '') // 過濾掉沒有姓名的行
+            .map((r, i) => ({
+              id: i, // 使用索引作為唯一 ID
+              name: r['姓名'] ? r['姓名'].trim() : `賓客${i+1}`, // 提供預設姓名
+              count: parseInt(r['參加人數']) || 1, // 確保 count 是數字，預設為 1
+              tag: r['Tag'] ? r['Tag'].trim() : '未分類' // 提供預設 Tag
+            }));
+          guests.forEach(g => { guestMap[g.id] = g; });
+          alert('已讀取 ' + guests.length + ' 位賓客資料');
+          renderResults(getUnassignedGuestIds()); // 讀取後顯示未分配列表
+        },
+        error: (error) => {
+            console.error("CSV 解析錯誤:", error);
+            alert("讀取 CSV 文件時發生錯誤，請檢查文件格式。需要包含 '姓名', '參加人數', 'Tag' 欄位。");
+        }
+      });
+    });
+
+    // 計算桌目前已坐人數
+    const tableOccupancy = t =>
+      t.assigned.reduce((s,id)=>s+guestMap[id].count,0);
+
+    // 某 Tag 在桌內累計人數
+    const tagCntInTable = (t, tag) =>
+      t.assigned.reduce((s,id)=> s + (guestMap[id].tag===tag ? guestMap[id].count:0),0);
+
+    // 標題顏色邏輯
+    function titleColor(t){
+      const occ = tableOccupancy(t);
+      const cap = t.capacity;
+      // 統計各 Tag 人數
+      const tagMap = {};
+      t.assigned.forEach(id => {
+        const tg = guestMap[id].tag;
+        tagMap[tg] = (tagMap[tg]||0) + guestMap[id].count;
+      });
+      const hasSingle = Object.values(tagMap).some(c=>c===1);
+
+      if (occ > cap)           return 'color:#e00';        // 紅
+      if (hasSingle)           return 'color:#f90';        // 橘
+      if (occ < cap)           return 'color:#080';        // 綠
+      return '';                                         // 剛好滿→黑
+    }
+
+    // 將一個單元嘗試放進桌子
+    function placeUnit(unit, tag){
+      for (const t of tables){
+        const occ = tableOccupancy(t);
+        if (occ + unit.size > t.capacity) continue;
+        // 同桌已有同 Tag 可以直接放；沒有同 Tag 也可放
+        t.assigned.push(...unit.members);
+        // 注意：這裡我們不直接使用 unassigned 變數，而是返回成功，讓調用者處理
+        return true;
+      }
+      return false; // 放不下，留在 unassigned
+    }
+
+    // 新的自動分配演算法
+    function autoAssign() {
+      // 重置
+      tables.forEach(t => t.assigned = []);
+      let unassigned = new Set(guests.map(g => g.id));
+
+      /* ---------- 1. 依 Tag 分組 ---------- */
+      const tagGroups = {};
+      guests.forEach(g => {
+        (tagGroups[g.tag] = tagGroups[g.tag] || []).push(g);
+      });
+
+      /* ---------- 2. 把「單人」先兩兩配對 ---------- */
+      const unitsByTag = {};           // { tag: [ { members:[guestId], size } , ... ] }
+      Object.entries(tagGroups).forEach(([tag, arr]) => {
+        const singles   = arr.filter(g => g.count === 1);
+        const multiples = arr.filter(g => g.count > 1);
+        const units = [];
+
+        // 2-1 先放不可拆的 >1 人單元
+        multiples.forEach(g => units.push({ members:[g.id], size:g.count }));
+
+        // 2-2 將單人兩兩配對
+        for (let i=0;i+1<singles.length;i+=2){
+          units.push({ members:[singles[i].id, singles[i+1].id], size:2 });
+        }
+        // 2-3 如果還剩 1 個單人，暫時先留下
+        if (singles.length % 2 === 1){
+          units.push({ members:[singles[singles.length-1].id], size:1 });  // 留下來等會兒再處理
+        }
+        unitsByTag[tag] = units;
+      });
+
+      /* ---------- 3. 依 Tag 總人數 (含單元大小) 由多到少塞桌 ---------- */
+      const sortedTags = Object.keys(unitsByTag).sort(
+          (a,b)=> unitsByTag[b].reduce((s,u)=>s+u.size,0) -
+                  unitsByTag[a].reduce((s,u)=>s+u.size,0));
+
+      for (const tag of sortedTags){
+        const units = unitsByTag[tag];
+
+        // 3-1 先塞 size>=2 的單元
+        for (const u of units.filter(x=>x.size>=2)){
+          const placed = placeUnit(u, tag);
+          if (placed) {
+            // 如果成功放置，從未分配列表中移除
+            u.members.forEach(id => unassigned.delete(id));
+          }
+        }
+      }
+
+      /* ---------- 4. 最後處理 size==1 的單元 ---------- */
+      for (const tag of sortedTags){
+        unitsByTag[tag]
+          .filter(u=>u.size===1)
+          .forEach(u=>{
+            // 找一張已經有同 Tag、且容得下 1 人的桌
+            const tgt = tables.find(t=>{
+              const occ = tableOccupancy(t);
+              const tagCount = tagCntInTable(t, tag);
+              return tagCount>=2 && occ+1<=t.capacity;
+            });
+            if (tgt){
+              tgt.assigned.push(u.members[0]);
+              unassigned.delete(u.members[0]);
+            }
+          });
+      }
+
+      /* ---------- 5. 驗證：把仍違規(該 Tag 僅 1 人)的拉回未分配 ---------- */
+      tables.forEach(t=>{
+        const tagMap = {};
+        t.assigned.forEach(id=>{
+          const tg = guestMap[id]?.tag;
+          if (tg) {  // 確保 tag 存在
+            tagMap[tg] = (tagMap[tg]||0) + (guestMap[id]?.count || 0);
+          }
+        });
+        Object.entries(tagMap).forEach(([tg, cnt])=>{
+          if (cnt===1){
+            // 找出該 Tag 的那位 (一定只有 1 位且 count=1)
+            const gid = t.assigned.find(id=>guestMap[id]?.tag===tg);
+            if (gid) {  // 確保 gid 存在
+              t.assigned = t.assigned.filter(id=>id!==gid);
+              unassigned.add(gid);
+            }
+          }
+        });
+      });
+
+      renderResults([...unassigned]);
+    }
+
+    // --- 更新後的顯示結果函式 (與上次相同，僅貼出確保完整性) ---
+    function renderResults(unassignedArrIds) {
+      const cont = document.getElementById('assignments');
+      cont.innerHTML = ''; // 清空之前的結果
+
+      tables.forEach(t => {
+        const div = document.createElement('div');
+        const currentOccupancy = tableOccupancy(t);
+        // 確保 guestMap[id] 存在才讀取 tag
+        const tagsInTable = new Set(t.assigned.map(id => guestMap[id]?.tag).filter(tag => tag != null));
+        const numTags = tagsInTable.size;
+
+        div.innerHTML = `<h3 style="${titleColor(t)}">桌 ${t.id} (已坐 ${currentOccupancy} / 上限 ${t.capacity}) - ${numTags} 種 Tag</h3>`;
+
+        const tableEl = document.createElement('table');
+        const thead = document.createElement('thead');
+        thead.innerHTML = `<tr><th>姓名</th><th>人數</th><th>Tag</th><th>調整座位</th></tr>`;
+        tableEl.appendChild(thead);
+
+        const tbody = document.createElement('tbody');
+        t.assigned.forEach(id => {
+          const g = guestMap[id];
+          if (!g) {
+              console.warn(`找不到 ID 為 ${id} 的賓客資料`);
+              return; // 跳過無效的 ID
+          }
+          const row = document.createElement('tr');
+          row.innerHTML = `
+            <td>${g.name}</td>
+            <td>${g.count}</td>
+            <td>${g.tag}</td>
+            <td>
+              <select data-guest-id="${id}" data-current-table-id="${t.id}">
+                <option value="">移出 (未分配)</option>
+                ${tables.map(x => `<option value="${x.id}" ${x.id === t.id ? 'selected' : ''}>桌 ${x.id}</option>`).join('')}
+              </select>
+            </td>
+          `;
+          tbody.appendChild(row);
+        });
+        tableEl.appendChild(tbody);
+        div.appendChild(tableEl);
+        cont.appendChild(div);
+      });
+
+      // --- 顯示未分配賓客 ---
+      const uaDiv = document.getElementById('unassigned');
+      uaDiv.innerHTML = ''; // 清空之前的未分配列表
+      // 直接使用傳入的 unassignedArrIds，因為它現在代表最終未分配列表
+      const currentUnassignedIds = unassignedArrIds;
+
+      if (currentUnassignedIds.length > 0) {
+         uaDiv.innerHTML = `<h3>未分配 (${currentUnassignedIds.length} 位)</h3>`;
+         currentUnassignedIds.forEach(id => {
+            const g = guestMap[id];
+            if (!g) {
+                 console.warn(`未分配列表中找不到 ID 為 ${id} 的賓客資料`);
+                 return;
+            }
+            const p = document.createElement('p');
+            p.innerHTML = `
+              ${g.name} (${g.count}) [${g.tag}]
+              <select data-guest-id="${id}" data-current-table-id="">
+                <option value="" selected>--</option>
+                ${tables.map(x => `<option value="${x.id}">桌 ${x.id}</option>`).join('')}
+              </select>
+            `;
+            uaDiv.appendChild(p);
+        });
+      } else {
+          uaDiv.innerHTML = '<p>所有賓客皆已分配座位。</p>';
+      }
+
+
+      // --- 為所有下拉選單（已分配和未分配的）添加事件監聽器 (與上次相同) ---
+      document.querySelectorAll('#assignments select, #unassigned select').forEach(sel => {
+        sel.onchange = function() {
+          const guestId = parseInt(this.dataset.guestId);
+          const newTableId = this.value === "" ? null : parseInt(this.value); // "" 表示未分配
+          const oldTableIdStr = this.dataset.currentTableId;
+          const oldTableId = oldTableIdStr === "" ? null : parseInt(oldTableIdStr);
+
+          console.log(`嘗試移動賓客 ${guestId} 從桌 ${oldTableId} 到桌 ${newTableId}`);
+
+          // 1. 從舊桌子移除 (如果 oldTableId 存在)
+          if (oldTableId !== null) {
+            const oldTable = tables.find(t => t.id === oldTableId);
+            if (oldTable) {
+              oldTable.assigned = oldTable.assigned.filter(id => id !== guestId);
+              console.log(`從桌 ${oldTableId} 移除 ${guestId}`);
+            } else {
+                 console.warn(`找不到舊桌子 ID: ${oldTableId}`);
+            }
+          } else {
+              console.log(`賓客 ${guestId} 原本未分配`);
+          }
+
+          // 2. 加入新桌子 (如果 newTableId 存在)
+          if (newTableId !== null) {
+            const newTable = tables.find(t => t.id === newTableId);
+            if (newTable) {
+               // 檢查容量
+               const currentOccupancy = newTable.assigned.reduce((sum, id) => sum + guestMap[id].count, 0);
+               const guestToAdd = guestMap[guestId];
+               if (currentOccupancy + guestToAdd.count <= newTable.capacity) {
+                   newTable.assigned.push(guestId);
+                   console.log(`將 ${guestId} 加入桌 ${newTableId}`);
+               } else {
+                   alert(`桌 ${newTableId} 容量不足以容納 ${guestToAdd.name} (${guestToAdd.count}人)！`);
+                   this.value = ""; // 強制移出
+                   // 從舊桌移出的操作仍然有效，所以現在是未分配狀態
+               }
+
+            } else {
+              console.warn(`找不到新桌子 ID: ${newTableId}`);
+              // 移動失敗，賓客回到未分配狀態
+            }
+          } else {
+               console.log(`賓客 ${guestId} 被移至未分配`);
+          }
+
+
+          // 3. 重新渲染所有內容以反映變化 (使用 getUnassignedGuestIds 獲取最新狀態)
+          renderResults(getUnassignedGuestIds());
+        };
+      });
+    }
+
+    // 輔助函數：獲取當前所有未分配的賓客 ID (與上次相同)
+    function getUnassignedGuestIds() {
+        const assignedIds = new Set(tables.flatMap(t => t.assigned));
+        // 從 guests 全集中過濾，而不是依賴舊的未分配列表
+        return guests.map(g => g.id).filter(id => !assignedIds.has(id));
+    }
+
+    document.getElementById('auto-assign').onclick = () => {
+      if (guests.length === 0) {
+        alert('請先上傳賓客清單'); return;
+      }
+      autoAssign();
+    };
+
+    // 匯出最終 CSV
+    document.getElementById('export-csv').onclick = () => {
+      const rows = [];
+       const finalUnassignedIds = getUnassignedGuestIds();
+
+      tables.forEach(t => {
+        t.assigned.forEach(id => {
+          const g = guestMap[id];
+           if (g) { // 確保賓客存在
+               rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: t.id });
+           }
+        });
+      });
+       // (可選) 將未分配的也加入 CSV，桌號留空
+       finalUnassignedIds.forEach(id => {
+           const g = guestMap[id];
+           if (g) {
+               rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: '未分配' });
+           }
+       });
+
+      if (rows.length === 0) {
+          alert("沒有可匯出的已分配賓客資料。");
+          return;
+      }
+
+      const csv = Papa.unparse(rows, {
+           header: true // 確保包含標頭
+       });
+      const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' }); // 添加 BOM 以確保 Excel 正確識別 UTF-8
+      saveAs(blob, 'seating_arrangement.csv');
+    };
+
+    // --- 頁面載入時初始化 ---
+    renderTablesConfig(); // 渲染初始桌位設定
+    renderResults([]);   // 初始渲染空的結果區域和未分配區域
+
+  </script>
+</body>
+</html>
+
