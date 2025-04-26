@@ -19,6 +19,58 @@
     th, td { padding: 8px; text-align: left; }
     #unassigned p { margin: 4px 0; }
     .warning { color: red; }
+    
+    /* Tag 統計表格樣式 */
+    .summary-table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-bottom: 15px;
+    }
+    .summary-table th, .summary-table td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    .summary-table th {
+      background-color: #f2f2f2;
+    }
+    .tag-distribution-item {
+      margin-bottom: 10px;
+    }
+    .table-sharing {
+      margin-bottom: 5px;
+      padding: 5px;
+      border-left: 3px solid #ccc;
+    }
+    
+    /* 座位圖樣式 */
+    #seating-map-container {
+      display: flex;
+      flex-wrap: wrap;
+    }
+    #seating-map {
+      width: 800px;
+      margin-right: 20px;
+    }
+    #map-legend {
+      width: 200px;
+    }
+    .legend-list {
+      list-style-type: none;
+      padding: 0;
+    }
+    .legend-list li {
+      display: flex;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+    .color-box {
+      display: inline-block;
+      width: 15px;
+      height: 15px;
+      margin-right: 5px;
+      border: 1px solid #333;
+    }
   </style>
 </head>
 <body>
@@ -38,12 +90,29 @@
     <button id="auto-assign">自動分配</button>
   </section>
 
+  <!-- Tag 統計與分佈區域 -->
+  <section id="tag-stats">
+    <h2>Tag 統計</h2>
+    <div id="tag-summary"></div>
+    <h3>分配後的分佈情況</h3>
+    <div id="tag-distribution"></div>
+  </section>
+
   <!-- 分配結果展示 -->
   <section id="results">
     <h2>分配結果</h2>
     <div id="assignments"></div>
     <h3>未分配</h3>
     <div id="unassigned"></div>
+  </section>
+
+  <!-- 視覺化座位區域 -->
+  <section id="seating-map-section">
+    <h2>座位圖</h2>
+    <div id="seating-map-container">
+      <div id="seating-map"></div>
+      <div id="map-legend"></div>
+    </div>
   </section>
 
   <!-- 匯出按鈕 -->
@@ -172,110 +241,294 @@
       return '';                                         // 剛好滿→黑
     }
 
-    // 將一個單元嘗試放進桌子
-    function placeUnit(unit, tag){
-      for (const t of tables){
-        const occ = tableOccupancy(t);
-        if (occ + unit.size > t.capacity) continue;
-        // 同桌已有同 Tag 可以直接放；沒有同 Tag 也可放
-        t.assigned.push(...unit.members);
-        // 注意：這裡我們不直接使用 unassigned 變數，而是返回成功，讓調用者處理
-        return true;
+    // 定義桌組
+    const TABLE_GROUP_A = [7, 8, 9, 10];
+    const TABLE_GROUP_B = [13, 14, 15, 16];
+    const TABLE_GROUP_C = [1, 2, 3, 4, 5, 6];
+    const TABLE_GROUP_D = [18, 19, 20, 21, 22];
+    const ALL_GROUPS_PRIORITY = [TABLE_GROUP_A, TABLE_GROUP_B, TABLE_GROUP_C, TABLE_GROUP_D];
+    const SPECIAL_TABLE_ID = 17;
+    const SPECIAL_TAGS = ["銘家人", "皺家人"];
+
+    // 將一個單元嘗試放入指定的桌組中
+    function placeUnitInGroups(unit, groupsToTry) {
+      for (const group of groupsToTry) {
+        for (const tableId of group) {
+          const t = tables.find(tbl => tbl.id === tableId);
+          if (!t || t.capacity === 0) continue; // 跳過不存在或容量為0的桌子
+          
+          const occ = tableOccupancy(t);
+          if (occ + unit.size <= t.capacity) {
+            t.assigned.push(...unit.members);
+            console.log(` -> ${unit.members.map(id=>guestMap[id].name).join('/')} (${unit.size}人) 安排到桌 ${t.id}`);
+            return true; // 成功放入
+          }
+        }
       }
-      return false; // 放不下，留在 unassigned
+      return false; // 在指定組中放不下
+    }
+    
+    // 嘗試將整個 Tag 的賓客安排到指定桌組的單一桌子
+    function placeEntireTagInGroups(tag, units, groupsToTry) {
+        const totalTagSize = units.reduce((sum, u) => sum + u.size, 0);
+        if (totalTagSize === 0) return false; // Tag 為空，無需放置
+
+        for (const group of groupsToTry) {
+            for (const tableId of group) {
+                const t = tables.find(tbl => tbl.id === tableId);
+                if (!t || t.capacity === 0) continue;
+
+                const occ = tableOccupancy(t);
+                if (occ === 0 && totalTagSize <= t.capacity) { // 優先放入空桌
+                    units.forEach(u => t.assigned.push(...u.members));
+                    console.log(` -> 整個 Tag [${tag}] (${totalTagSize}人) 安排到空桌 ${t.id}`);
+                    return true;
+                }
+                // 如果沒有空桌，嘗試放入還有足夠空間的桌子
+                 if (occ > 0 && occ + totalTagSize <= t.capacity) {
+                     units.forEach(u => t.assigned.push(...u.members));
+                     console.log(` -> 整個 Tag [${tag}] (${totalTagSize}人) 添加到桌 ${t.id}`);
+                     return true;
+                 }
+            }
+        }
+        return false;
+    }
+    
+    // 找尋適合放置單人的桌子 (優先同Tag >= 2人)
+    function findTableForSingle(unit, groupsToTry) {
+        const guest = guestMap[unit.members[0]];
+        if (!guest) return null;
+        const tag = guest.tag;
+
+        for (const group of groupsToTry) {
+            for (const tableId of group) {
+                const t = tables.find(tbl => tbl.id === tableId);
+                if (!t || t.capacity === 0) continue;
+                
+                 // 特殊規則：第17桌只收特定Tag
+                if (t.id === SPECIAL_TABLE_ID && !SPECIAL_TAGS.includes(tag)) continue;
+
+                const occ = tableOccupancy(t);
+                const tagCountInTbl = tagCntInTable(t, tag);
+
+                // 優先放入已有同 Tag >= 2 人的桌子
+                if (tagCountInTbl >= 2 && occ + 1 <= t.capacity) {
+                    return t;
+                }
+            }
+        }
+        
+        // 如果找不到有同 Tag >= 2 人的桌子，則退而求其次，找任何有空位的桌子
+         for (const group of groupsToTry) {
+             for (const tableId of group) {
+                 const t = tables.find(tbl => tbl.id === tableId);
+                 if (!t || t.capacity === 0) continue;
+                 if (t.id === SPECIAL_TABLE_ID && !SPECIAL_TAGS.includes(tag)) continue;
+                 const occ = tableOccupancy(t);
+                 if (occ + 1 <= t.capacity) {
+                     return t;
+                 }
+             }
+         }
+
+        return null; // 找不到適合的桌子
     }
 
     // 新的自動分配演算法
     function autoAssign() {
+      console.log("--- 開始自動分配 ---");
       // 重置
       tables.forEach(t => t.assigned = []);
       let unassigned = new Set(guests.map(g => g.id));
+      const assignedInThisRun = new Set(); // 追蹤此輪已成功分配的賓客ID
 
-      /* ---------- 1. 依 Tag 分組 ---------- */
+      /* ---------- -1. 特殊規則：共同 Tag 安排在第 1 桌 ---------- */
+      const commonTable = tables.find(t => t.id === 1);
+      if (commonTable) {
+          const commonTagName = "共同"; // 定義共同 Tag 名稱
+          const commonGuests = guests.filter(g => g.tag === commonTagName);
+          let commonAssignedCount = 0;
+          let commonTotalPeople = 0;
+          commonGuests.forEach(g => {
+              if (unassigned.has(g.id)) { // 確保只處理未分配的
+                  commonTable.assigned.push(g.id);
+                  unassigned.delete(g.id);
+                  assignedInThisRun.add(g.id);
+                  commonAssignedCount++;
+                  commonTotalPeople += g.count;
+              }
+          });
+          if (commonAssignedCount > 0) {
+              console.log(`特殊規則：已將 ${commonAssignedCount} 位 [${commonTagName}] Tag 賓客強制安排到第 ${commonTable.id} 桌 (共 ${commonTotalPeople} 人)`);
+              // 雖然忽略容量，但還是提醒一下如果超額
+              if (commonTotalPeople > commonTable.capacity) {
+                  console.warn(` -> 警告：第 ${commonTable.id} 桌容量 (${commonTable.capacity}) 已被 [${commonTagName}] Tag 超過 (${commonTotalPeople} 人)`);
+              }
+          }
+      } else {
+          console.warn("警告: 找不到第 1 桌，無法執行 [共同] Tag 的特殊分配規則");
+      }
+
+      /* ---------- 0. 特殊規則：銘家人與皺家人安排在第17桌 ---------- */
+      const specialTable = tables.find(t => t.id === SPECIAL_TABLE_ID);
+      if (specialTable && specialTable.capacity > 0) {
+        const specialGuests = guests.filter(g => SPECIAL_TAGS.includes(g.tag));
+        const specialGuestCount = specialGuests.reduce((sum, g) => sum + g.count, 0);
+
+        if (specialGuestCount <= specialTable.capacity) {
+          specialGuests.forEach(g => {
+            if (unassigned.has(g.id)) { // 確保只處理未分配的
+              specialTable.assigned.push(g.id);
+              unassigned.delete(g.id);
+              assignedInThisRun.add(g.id);
+            }
+          });
+          console.log(`特殊規則：已將 ${specialGuests.filter(g => assignedInThisRun.has(g.id)).length} 位 ${SPECIAL_TAGS.join('/')} 賓客優先安排到第 ${specialTable.id} 桌 (共 ${specialGuestCount} 人)`);
+        } else {
+          console.warn(`警告: 第 ${specialTable.id} 桌容量 (${specialTable.capacity}) 不足以容納所有 ${SPECIAL_TAGS.join('/')} 賓客 (${specialGuestCount} 人)，他們將按一般規則分配。`);
+        }
+      } else {
+        console.warn(`警告: 找不到第 ${SPECIAL_TABLE_ID} 桌或其容量為0，無法執行特殊分配規則`);
+      }
+
+      /* ---------- 1. 依 Tag 分組 (排除已分配) ---------- */
       const tagGroups = {};
       guests.forEach(g => {
+        if (!unassigned.has(g.id)) return; // 跳過已分配的
         (tagGroups[g.tag] = tagGroups[g.tag] || []).push(g);
       });
 
-      /* ---------- 2. 把「單人」先兩兩配對 ---------- */
-      const unitsByTag = {};           // { tag: [ { members:[guestId], size } , ... ] }
+      /* ---------- 2. 建立分配單元 (Unit) ---------- */
+      const unitsByTag = {};
       Object.entries(tagGroups).forEach(([tag, arr]) => {
         const singles   = arr.filter(g => g.count === 1);
         const multiples = arr.filter(g => g.count > 1);
         const units = [];
-
-        // 2-1 先放不可拆的 >1 人單元
-        multiples.forEach(g => units.push({ members:[g.id], size:g.count }));
-
-        // 2-2 將單人兩兩配對
-        for (let i=0;i+1<singles.length;i+=2){
-          units.push({ members:[singles[i].id, singles[i+1].id], size:2 });
+        multiples.forEach(g => units.push({ members:[g.id], size:g.count, tag: g.tag }));
+        for (let i=0; i+1 < singles.length; i+=2) {
+          units.push({ members:[singles[i].id, singles[i+1].id], size:2, tag: tag });
         }
-        // 2-3 如果還剩 1 個單人，暫時先留下
-        if (singles.length % 2 === 1){
-          units.push({ members:[singles[singles.length-1].id], size:1 });  // 留下來等會兒再處理
+        if (singles.length % 2 === 1) {
+          units.push({ members:[singles[singles.length-1].id], size:1, tag: tag });
         }
         unitsByTag[tag] = units;
       });
 
-      /* ---------- 3. 依 Tag 總人數 (含單元大小) 由多到少塞桌 ---------- */
+      /* ---------- 3. 依 Tag 總人數由多到少排序，嘗試分配 ---------- */
       const sortedTags = Object.keys(unitsByTag).sort(
           (a,b)=> unitsByTag[b].reduce((s,u)=>s+u.size,0) -
                   unitsByTag[a].reduce((s,u)=>s+u.size,0));
 
-      for (const tag of sortedTags){
+      console.log("開始分配主要賓客群...");
+      for (const tag of sortedTags) {
         const units = unitsByTag[tag];
-
-        // 3-1 先塞 size>=2 的單元
-        for (const u of units.filter(x=>x.size>=2)){
-          const placed = placeUnit(u, tag);
-          if (placed) {
-            // 如果成功放置，從未分配列表中移除
-            u.members.forEach(id => unassigned.delete(id));
-          }
+        if (units.length === 0) continue;
+        console.log(`處理 Tag: ${tag} (共 ${units.reduce((s, u) => s + u.size, 0)} 人)`);
+        
+        // 3-1 嘗試將整個 Tag 放入單一桌 (優先 A/B 組，其次 C/D 組)
+        const placedEntireTag = placeEntireTagInGroups(tag, units, [TABLE_GROUP_A, TABLE_GROUP_B]) || 
+                              placeEntireTagInGroups(tag, units, [TABLE_GROUP_C, TABLE_GROUP_D]);
+                              
+        if (placedEntireTag) {
+            units.forEach(u => u.members.forEach(id => {
+                unassigned.delete(id);
+                assignedInThisRun.add(id);
+            }));
+            continue; // 整個 Tag 已處理完畢，處理下一個 Tag
+        }
+        
+        // 3-2 如果無法放整個 Tag，則分配 size >= 2 的單元 (優先 A/B 組，其次 C/D 組)
+        console.log(` -> Tag [${tag}] 無法放入單桌，逐一分配 size>=2 的單元...`);
+        const largeUnits = units.filter(u => u.size >= 2).sort((a, b) => b.size - a.size);
+        for (const unit of largeUnits) {
+             const placed = placeUnitInGroups(unit, [TABLE_GROUP_A, TABLE_GROUP_B]) || 
+                           placeUnitInGroups(unit, [TABLE_GROUP_C, TABLE_GROUP_D]);
+             if (placed) {
+                 unit.members.forEach(id => {
+                     unassigned.delete(id);
+                     assignedInThisRun.add(id);
+                 });
+             }
         }
       }
 
-      /* ---------- 4. 最後處理 size==1 的單元 ---------- */
+      /* ---------- 4. 最後處理 size == 1 的單元 ---------- */
+      console.log("開始處理剩餘單人賓客...");
       for (const tag of sortedTags){
-        unitsByTag[tag]
-          .filter(u=>u.size===1)
-          .forEach(u=>{
-            // 找一張已經有同 Tag、且容得下 1 人的桌
-            const tgt = tables.find(t=>{
-              const occ = tableOccupancy(t);
-              const tagCount = tagCntInTable(t, tag);
-              return tagCount>=2 && occ+1<=t.capacity;
-            });
-            if (tgt){
-              tgt.assigned.push(u.members[0]);
-              unassigned.delete(u.members[0]);
+        const singleUnits = unitsByTag[tag].filter(u => u.size === 1 && unassigned.has(u.members[0]));
+        
+        for (const unit of singleUnits) {
+            // 找尋適合的桌子 (優先 A/B 組，其次 C/D 組)
+            const targetTable = findTableForSingle(unit, [TABLE_GROUP_A, TABLE_GROUP_B]) ||
+                                findTableForSingle(unit, [TABLE_GROUP_C, TABLE_GROUP_D]);
+                                
+            if (targetTable) {
+                targetTable.assigned.push(unit.members[0]);
+                unassigned.delete(unit.members[0]);
+                assignedInThisRun.add(unit.members[0]);
+                console.log(` -> 單人 ${guestMap[unit.members[0]].name} [${tag}] 安排到桌 ${targetTable.id}`);
+            } else {
+                 console.log(` -> 單人 ${guestMap[unit.members[0]].name} [${tag}] 找不到合適的桌子，保留為未分配`);
             }
-          });
+        }
       }
+      
+       /* ---------- 4.5 (可選) 再次嘗試分配剩餘的未分配賓客 (任何桌子) ---------- */
+       console.log("最後檢查是否有任何空位可容納未分配賓客...");
+       const remainingUnassigned = [...unassigned]; // 複製一份，避免迭代時修改
+       remainingUnassigned.forEach(guestId => {
+           const guest = guestMap[guestId];
+           if (!guest) return;
+           const unit = { members: [guestId], size: guest.count, tag: guest.tag };
+           
+            // 從 A組 -> B組 -> C組 -> D組 -> 第17桌 (如果標籤允許) 依序嘗試
+           const placed = placeUnitInGroups(unit, [TABLE_GROUP_A]) || 
+                          placeUnitInGroups(unit, [TABLE_GROUP_B]) ||
+                          placeUnitInGroups(unit, [TABLE_GROUP_C]) ||
+                          placeUnitInGroups(unit, [TABLE_GROUP_D]) ||
+                          (SPECIAL_TAGS.includes(unit.tag) && placeUnitInGroups(unit, [[SPECIAL_TABLE_ID]])); // 特殊桌
+                          
+           if (placed) {
+               unassigned.delete(guestId);
+               assignedInThisRun.add(guestId);
+                console.log(` -> 再次嘗試： ${guest.name} (${guest.count}人) [${guest.tag}] 安排到某桌`);
+           }
+       });
 
       /* ---------- 5. 驗證：把仍違規(該 Tag 僅 1 人)的拉回未分配 ---------- */
+      console.log("驗證分配結果 (單人 Tag)... ");
       tables.forEach(t=>{
+        if (t.id === SPECIAL_TABLE_ID) return; // 第17桌豁免
+        
         const tagMap = {};
-        t.assigned.forEach(id=>{
-          const tg = guestMap[id]?.tag;
-          if (tg) {  // 確保 tag 存在
-            tagMap[tg] = (tagMap[tg]||0) + (guestMap[id]?.count || 0);
-          }
+        const currentAssigned = [...t.assigned]; // 複製，避免迭代時修改
+        currentAssigned.forEach(id=>{
+            if (!assignedInThisRun.has(id)) return; // 只驗證本輪分配的
+            const g = guestMap[id];
+            if (!g) return;
+            tagMap[g.tag] = (tagMap[g.tag]||0) + g.count;
         });
+
         Object.entries(tagMap).forEach(([tg, cnt])=>{
-          if (cnt===1){
-            // 找出該 Tag 的那位 (一定只有 1 位且 count=1)
-            const gid = t.assigned.find(id=>guestMap[id]?.tag===tg);
-            if (gid) {  // 確保 gid 存在
-              t.assigned = t.assigned.filter(id=>id!==gid);
+          if (cnt === 1){
+            const gid = currentAssigned.find(id => assignedInThisRun.has(id) && guestMap[id]?.tag === tg && guestMap[id]?.count === 1);
+            if (gid) {
+              t.assigned = t.assigned.filter(id => id !== gid);
               unassigned.add(gid);
+              assignedInThisRun.delete(gid); // 從本輪成功分配中移除
+              console.log(` -> 驗證失敗：將桌 ${t.id} 的 ${guestMap[gid].name} [${tg}] 拉回未分配 (Tag人數為1)`);
             }
           }
         });
       });
 
+      console.log("--- 自動分配結束 ---");
+      // 使用最終的 unassigned 集合來渲染
       renderResults([...unassigned]);
+      renderTagSummary();
+      renderTagDistribution();
+      renderSeatingMap();
     }
 
     // --- 更新後的顯示結果函式 (與上次相同，僅貼出確保完整性) ---
@@ -327,7 +580,7 @@
       const uaDiv = document.getElementById('unassigned');
       uaDiv.innerHTML = ''; // 清空之前的未分配列表
       // 直接使用傳入的 unassignedArrIds，因為它現在代表最終未分配列表
-      const currentUnassignedIds = unassignedArrIds;
+      const currentUnassignedIds = unassignedArrIds || getUnassignedGuestIds();
 
       if (currentUnassignedIds.length > 0) {
          uaDiv.innerHTML = `<h3>未分配 (${currentUnassignedIds.length} 位)</h3>`;
@@ -350,7 +603,6 @@
       } else {
           uaDiv.innerHTML = '<p>所有賓客皆已分配座位。</p>';
       }
-
 
       // --- 為所有下拉選單（已分配和未分配的）添加事件監聽器 (與上次相同) ---
       document.querySelectorAll('#assignments select, #unassigned select').forEach(sel => {
@@ -399,9 +651,10 @@
                console.log(`賓客 ${guestId} 被移至未分配`);
           }
 
-
           // 3. 重新渲染所有內容以反映變化 (使用 getUnassignedGuestIds 獲取最新狀態)
           renderResults(getUnassignedGuestIds());
+          renderTagDistribution(); // 新增：更新 Tag 分佈
+          renderSeatingMap(); // 新增：更新座位圖
         };
       });
     }
@@ -413,6 +666,386 @@
         return guests.map(g => g.id).filter(id => !assignedIds.has(id));
     }
 
+    // Tag 統計功能
+    function renderTagSummary() {
+      const tagSummary = document.getElementById('tag-summary');
+      if (guests.length === 0) {
+        tagSummary.innerHTML = '<p>請先上傳賓客清單</p>';
+        window.tagColors = {};
+        return;
+      }
+
+      const tagStats = {};
+      const uniqueTags = new Set();
+      guests.forEach(g => {
+        uniqueTags.add(g.tag);
+        if (!tagStats[g.tag]) {
+          tagStats[g.tag] = { count: 0, people: 0 };
+        }
+        tagStats[g.tag].count++;
+        tagStats[g.tag].people += g.count;
+      });
+
+      // --- 顏色分配邏輯 (確保唯一性) ---
+      const predefinedColors = [
+        '#e41a1c', '#377eb8', '#4daf4a', '#984ea3',
+        '#ff7f00', '#ffff33', '#a65628', '#f781bf',
+        '#3498db', '#e74c3c', '#2ecc71', '#9b59b6',
+        '#1abc9c', '#f1c40f', '#34495e', '#7f8c8d'
+      ];
+      const defaultColor = '#808080';
+      const tagColors = {};
+      const assignedColors = new Set(); // 用來追蹤已分配的顏色值
+      let colorIndex = 0;
+
+      uniqueTags.forEach(tag => {
+          let assignedColor = null;
+          // 從上次停止的地方繼續尋找下一個可用的預定義顏色
+          for (let i = 0; i < predefinedColors.length; i++) {
+              const potentialColor = predefinedColors[colorIndex % predefinedColors.length];
+              if (!assignedColors.has(potentialColor)) {
+                  assignedColor = potentialColor;
+                  tagColors[tag] = assignedColor;
+                  assignedColors.add(assignedColor);
+                  colorIndex++; // 移動到下一個索引供下次使用
+                  break; // 找到唯一顏色，處理下一個 Tag
+              }
+              colorIndex++; // 這個顏色已被使用，嘗試列表中的下一個
+          }
+
+          // 如果所有預定義顏色都已被分配
+          if (!assignedColor) {
+              tagColors[tag] = defaultColor;
+              console.warn(`警告：預定義顏色不足，Tag "${tag}" 被分配了預設灰色。`);
+          }
+      });
+      // --- 顏色分配結束 ---
+
+      // 生成摘要 HTML
+      let html = '<table class="summary-table"><thead><tr><th>Tag</th><th>組數</th><th>人數</th></tr></thead><tbody>';
+      Object.entries(tagStats).sort(([, statA], [, statB]) => statB.people - statA.people)
+        .forEach(([tag, stat]) => {
+          const displayColor = tagColors[tag] || defaultColor;
+          html += `<tr>
+            <td><span style="color: ${displayColor}">${tag}</span></td>
+            <td>${stat.count}</td>
+            <td>${stat.people}</td>
+          </tr>`;
+      });
+
+      html += '</tbody></table>';
+      tagSummary.innerHTML = html;
+
+      window.tagColors = tagColors;
+    }
+
+    // 顯示分配後的分佈情況
+    function renderTagDistribution() {
+      const tagDistribution = document.getElementById('tag-distribution');
+      if (guests.length === 0) {
+        tagDistribution.innerHTML = '<p>請先上傳賓客清單</p>';
+        return;
+      }
+      
+      // 獲取每桌的 Tag 分佈
+      const tableTagMap = {};
+      tables.forEach(t => {
+        tableTagMap[t.id] = {};
+        t.assigned.forEach(id => {
+          const g = guestMap[id];
+          if (g) {
+            if (!tableTagMap[t.id][g.tag]) {
+              tableTagMap[t.id][g.tag] = 0;
+            }
+            tableTagMap[t.id][g.tag] += g.count;
+          }
+        });
+      });
+      
+      // 獲取每個 Tag 的桌子分佈
+      const tagTableMap = {};
+      Object.entries(tableTagMap).forEach(([tableId, tags]) => {
+        Object.entries(tags).forEach(([tag, count]) => {
+          if (!tagTableMap[tag]) {
+            tagTableMap[tag] = [];
+          }
+          tagTableMap[tag].push({ tableId, count });
+        });
+      });
+      
+      // 統計未分配賓客
+      const unassignedIds = getUnassignedGuestIds();
+      const unassignedTagStats = {};
+      unassignedIds.forEach(id => {
+        const g = guestMap[id];
+        if (g) {
+          if (!unassignedTagStats[g.tag]) {
+            unassignedTagStats[g.tag] = 0;
+          }
+          unassignedTagStats[g.tag] += g.count;
+        }
+      });
+      
+      // 生成分佈 HTML
+      let html = '<h4>Tag 分佈到各桌</h4>';
+      
+      Object.entries(tagTableMap).forEach(([tag, tables]) => {
+        const tagColor = window.tagColors?.[tag] || '#000000';
+        
+        html += `<div class="tag-distribution-item">
+          <h5 style="color: ${tagColor}">${tag}</h5>
+          <p>分配到: ${tables.map(t => `桌 ${t.tableId} (${t.count}人)`).join('、')} </p>
+        </div>`;
+      });
+      
+      // 顯示未分配賓客
+      if (Object.keys(unassignedTagStats).length > 0) {
+        html += '<h4>未分配賓客</h4>';
+        
+        Object.entries(unassignedTagStats).forEach(([tag, count]) => {
+          const tagColor = window.tagColors?.[tag] || '#000000';
+          html += `<div class="tag-distribution-item">
+            <span style="color: ${tagColor}">${tag}: ${count}人</span>
+          </div>`;
+        });
+      }
+      
+      // 共桌情況
+      html += '<h4>共桌情況</h4>';
+      Object.entries(tableTagMap).forEach(([tableId, tags]) => {
+        if (Object.keys(tags).length > 1) {
+          html += `<div class="table-sharing">
+            <p>桌 ${tableId} 共桌: ${Object.entries(tags).map(([tag, count]) => 
+              `<span style="color: ${window.tagColors?.[tag] || '#000000'}">${tag} (${count}人)</span>`
+            ).join('、')}</p>
+          </div>`;
+        }
+      });
+      
+      tagDistribution.innerHTML = html;
+    }
+
+    // 繪製座位圖
+    function renderSeatingMap() {
+      const mapContainer = document.getElementById('seating-map');
+      const legendContainer = document.getElementById('map-legend');
+      
+      // 清空容器
+      mapContainer.innerHTML = '';
+      legendContainer.innerHTML = '';
+      
+      // 創建座位圖 SVG
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("width", "800");
+      svg.setAttribute("height", "600");
+      svg.style.border = "1px solid #ccc";
+      svg.style.background = "#fff";
+      mapContainer.appendChild(svg);
+      
+      // 添加舞台區
+      const stage = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      stage.setAttribute("x", "300");
+      stage.setAttribute("y", "50");
+      stage.setAttribute("width", "200");
+      stage.setAttribute("height", "80");
+      stage.setAttribute("fill", "#f9f9f9");
+      stage.setAttribute("stroke", "#666");
+      svg.appendChild(stage);
+      
+      // 添加舞台文字
+      const stageText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      stageText.setAttribute("x", "400");
+      stageText.setAttribute("y", "95");
+      stageText.setAttribute("text-anchor", "middle");
+      stageText.textContent = "舞台區";
+      svg.appendChild(stageText);
+      
+      // 添加主桌
+      const mainTable = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      mainTable.setAttribute("x", "370");
+      mainTable.setAttribute("y", "350");
+      mainTable.setAttribute("width", "60");
+      mainTable.setAttribute("height", "30");
+      mainTable.setAttribute("fill", "#f9f9f9");
+      mainTable.setAttribute("stroke", "#666");
+      svg.appendChild(mainTable);
+      
+      // 添加主桌文字
+      const mainTableText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      mainTableText.setAttribute("x", "400");
+      mainTableText.setAttribute("y", "370");
+      mainTableText.setAttribute("text-anchor", "middle");
+      mainTableText.textContent = "主桌";
+      svg.appendChild(mainTableText);
+      
+      // 添加吧台區
+      const bar = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      bar.setAttribute("x", "300");
+      bar.setAttribute("y", "450");
+      bar.setAttribute("width", "200");
+      bar.setAttribute("height", "50");
+      bar.setAttribute("fill", "#f9f9f9");
+      bar.setAttribute("stroke", "#666");
+      svg.appendChild(bar);
+      
+      // 添加吧台文字
+      const barText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      barText.setAttribute("x", "400");
+      barText.setAttribute("y", "480");
+      barText.setAttribute("text-anchor", "middle");
+      barText.textContent = "吧檯區";
+      svg.appendChild(barText);
+      
+      // 添加紅框（無座位區域）
+      const redArea1 = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      redArea1.setAttribute("x", "350");
+      redArea1.setAttribute("y", "150");
+      redArea1.setAttribute("width", "100");
+      redArea1.setAttribute("height", "80");
+      redArea1.setAttribute("fill", "none");
+      redArea1.setAttribute("stroke", "red");
+      redArea1.setAttribute("stroke-width", "2");
+      svg.appendChild(redArea1);
+      
+      const redArea2 = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      redArea2.setAttribute("x", "350");
+      redArea2.setAttribute("y", "230");
+      redArea2.setAttribute("width", "100");
+      redArea2.setAttribute("height", "80");
+      redArea2.setAttribute("fill", "none");
+      redArea2.setAttribute("stroke", "red");
+      redArea2.setAttribute("stroke-width", "2");
+      svg.appendChild(redArea2);
+      
+      // 繪製桌子
+      // 定義桌子位置（依據上傳的座位圖設計）
+      const tablePositions = {
+        // 左側桌子
+        1: {x: 150, y: 150}, 
+        2: {x: 150, y: 200},
+        3: {x: 150, y: 250},
+        4: {x: 150, y: 300},
+        5: {x: 150, y: 350},
+        6: {x: 150, y: 400},
+        
+        // 中間左側桌子
+        7: {x: 250, y: 150},
+        8: {x: 250, y: 200},
+        9: {x: 250, y: 250},
+        10: {x: 250, y: 300},
+        
+        // 中間右側桌子
+        11: {x: 450, y: 200},
+        12: {x: 450, y: 250},
+        13: {x: 550, y: 150},
+        14: {x: 550, y: 200},
+        15: {x: 550, y: 250},
+        16: {x: 550, y: 300},
+        
+        // 右側桌子
+        17: {x: 650, y: 150},
+        18: {x: 650, y: 200},
+        19: {x: 650, y: 250},
+        20: {x: 650, y: 300},
+        21: {x: 650, y: 350},
+        22: {x: 650, y: 400}
+      };
+      
+      // 繪製每張桌子
+      tables.forEach(table => {
+        const position = tablePositions[table.id];
+        if (!position) return; // 跳過沒有定義位置的桌子
+        
+        // 獲取該桌的 Tag 分佈
+        const tagDistribution = {};
+        table.assigned.forEach(id => {
+          const g = guestMap[id];
+          if (g) {
+            if (!tagDistribution[g.tag]) {
+              tagDistribution[g.tag] = 0;
+            }
+            tagDistribution[g.tag] += g.count;
+          }
+        });
+        
+        // 決定桌子顏色：如果只有一種 Tag，用 Tag 顏色；否則用混合色
+        let tableColor = "#cccccc"; // 預設灰色
+        const tags = Object.keys(tagDistribution);
+        
+        if (tags.length === 1) {
+          tableColor = window.tagColors?.[tags[0]] || tableColor;
+        } else if (tags.length > 1) {
+          tableColor = "#B3B3B3"; // 多 Tag 混合色
+        }
+        
+        // 繪製桌子圓形
+        const tableCircle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        tableCircle.setAttribute("cx", position.x);
+        tableCircle.setAttribute("cy", position.y);
+        tableCircle.setAttribute("r", "25");
+        tableCircle.setAttribute("fill", tableColor);
+        tableCircle.setAttribute("stroke", "#333");
+        svg.appendChild(tableCircle);
+        
+        // 添加桌號
+        const tableNumber = document.createElementNS("http://www.w3.org/2000/svg", "text");
+        tableNumber.setAttribute("x", position.x);
+        tableNumber.setAttribute("y", position.y + 5);
+        tableNumber.setAttribute("text-anchor", "middle");
+        tableNumber.setAttribute("fill", "#fff");
+        tableNumber.setAttribute("font-weight", "bold");
+        tableNumber.textContent = table.id;
+        svg.appendChild(tableNumber);
+        
+        // 如果有多個 Tag，添加餅圖表示
+        if (tags.length > 1) {
+          let startAngle = 0;
+          const total = Object.values(tagDistribution).reduce((a, b) => a + b, 0);
+          
+          Object.entries(tagDistribution).forEach(([tag, count]) => {
+            const percentage = count / total;
+            const endAngle = startAngle + percentage * 2 * Math.PI;
+            
+            const x1 = position.x + 25 * Math.sin(startAngle);
+            const y1 = position.y - 25 * Math.cos(startAngle);
+            const x2 = position.x + 25 * Math.sin(endAngle);
+            const y2 = position.y - 25 * Math.cos(endAngle);
+            
+            const largeArcFlag = percentage > 0.5 ? 1 : 0;
+            
+            const pathData = [
+              `M ${position.x} ${position.y}`,
+              `L ${x1} ${y1}`,
+              `A 25 25 0 ${largeArcFlag} 1 ${x2} ${y2}`,
+              'Z'
+            ].join(' ');
+            
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.setAttribute("d", pathData);
+            path.setAttribute("fill", window.tagColors?.[tag] || "#cccccc");
+            path.setAttribute("stroke", "#333");
+            path.setAttribute("stroke-width", "1");
+            svg.appendChild(path);
+            
+            startAngle = endAngle;
+          });
+        }
+      });
+      
+      // 生成圖例
+      let legendHtml = '<h4>Tag 顏色圖例</h4><ul class="legend-list">';
+      
+      Object.entries(window.tagColors || {}).forEach(([tag, color]) => {
+        legendHtml += `<li>
+          <span class="color-box" style="background-color: ${color}"></span>
+          <span>${tag}</span>
+        </li>`;
+      });
+      
+      legendHtml += '</ul>';
+      legendContainer.innerHTML = legendHtml;
+    }
+
     document.getElementById('auto-assign').onclick = () => {
       if (guests.length === 0) {
         alert('請先上傳賓客清單'); return;
@@ -420,41 +1053,70 @@
       autoAssign();
     };
 
-    // 匯出最終 CSV
-    document.getElementById('export-csv').onclick = () => {
-      const rows = [];
-       const finalUnassignedIds = getUnassignedGuestIds();
+    // 在文檔載入完成後執行的主要函數
+    document.addEventListener('DOMContentLoaded', function() {
+      // 設置添加表格按鈕
+      document.getElementById('add-table').onclick = addTable;
+      
+      // 設置自動分配按鈕
+      document.getElementById('auto-assign').onclick = autoAssign;
 
-      tables.forEach(t => {
-        t.assigned.forEach(id => {
-          const g = guestMap[id];
-           if (g) { // 確保賓客存在
-               rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: t.id });
-           }
+      // 設置導出按鈕
+      document.getElementById('export-csv').onclick = function() {
+        const rows = [];
+        const finalUnassignedIds = getUnassignedGuestIds();
+
+        tables.forEach(t => {
+          t.assigned.forEach(id => {
+            const g = guestMap[id];
+            if (g) { // 確保賓客存在
+              rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: t.id });
+            }
+          });
         });
-      });
-       // (可選) 將未分配的也加入 CSV，桌號留空
-       finalUnassignedIds.forEach(id => {
-           const g = guestMap[id];
-           if (g) {
-               rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: '未分配' });
-           }
-       });
+        // (可選) 將未分配的也加入 CSV，桌號留空
+        finalUnassignedIds.forEach(id => {
+            const g = guestMap[id];
+            if (g) {
+                rows.push({ 姓名: g.name, '參加人數': g.count, Tag: g.tag, 桌號: '未分配' });
+            }
+        });
 
-      if (rows.length === 0) {
-          alert("沒有可匯出的已分配賓客資料。");
-          return;
-      }
+        if (rows.length === 0) {
+            alert("沒有可匯出的已分配賓客資料。");
+            return;
+        }
 
-      const csv = Papa.unparse(rows, {
-           header: true // 確保包含標頭
-       });
-      const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' }); // 添加 BOM 以確保 Excel 正確識別 UTF-8
-      saveAs(blob, 'seating_arrangement.csv');
-    };
+        const csv = Papa.unparse(rows, {
+            header: true // 確保包含標頭
+        });
+        const blob = new Blob(["\uFEFF" + csv], { type: 'text/csv;charset=utf-8;' }); // 添加 BOM 以確保 Excel 正確識別 UTF-8
+        saveAs(blob, 'seating_arrangement.csv');
+      };
 
+      // 初始化標籤統計和座位圖
+      renderTagSummary(); // 新增：初始化標籤統計
+      renderTagDistribution(); // 新增：初始化標籤分佈
+      renderSeatingMap(); // 新增：初始化座位圖
+    });
+    
     // --- 頁面載入時初始化 ---
-    renderTablesConfig(); // 渲染初始桌位設定
+    function initializeTables() {
+        tables.length = 0; // 清空現有桌子
+        for (let i = 1; i <= 22; i++) {
+            let capacity = 6; // 預設容量
+            if (i === 7 || i === 13) {
+                capacity = 4;
+            } else if (i === 11 || i === 12) {
+                capacity = 0; // 容量設為 0，使其不可用
+            }
+            tables.push({ id: i, capacity: capacity, assigned: [] });
+        }
+        renderTablesConfig(); // 渲染配置好的桌子
+    }
+    
+    // --- 頁面載入時執行 ---
+    initializeTables(); // 初始化桌位
     renderResults([]);   // 初始渲染空的結果區域和未分配區域
 
   </script>
