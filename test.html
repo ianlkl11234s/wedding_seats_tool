@@ -343,6 +343,33 @@
       let unassigned = new Set(guests.map(g => g.id));
       const assignedInThisRun = new Set(); // 追蹤此輪已成功分配的賓客ID
 
+      /* ---------- -1. 特殊規則：共同 Tag 安排在第 1 桌 ---------- */
+      const commonTable = tables.find(t => t.id === 1);
+      if (commonTable) {
+          const commonTagName = "共同"; // 定義共同 Tag 名稱
+          const commonGuests = guests.filter(g => g.tag === commonTagName);
+          let commonAssignedCount = 0;
+          let commonTotalPeople = 0;
+          commonGuests.forEach(g => {
+              if (unassigned.has(g.id)) { // 確保只處理未分配的
+                  commonTable.assigned.push(g.id);
+                  unassigned.delete(g.id);
+                  assignedInThisRun.add(g.id);
+                  commonAssignedCount++;
+                  commonTotalPeople += g.count;
+              }
+          });
+          if (commonAssignedCount > 0) {
+              console.log(`特殊規則：已將 ${commonAssignedCount} 位 [${commonTagName}] Tag 賓客強制安排到第 ${commonTable.id} 桌 (共 ${commonTotalPeople} 人)`);
+              // 雖然忽略容量，但還是提醒一下如果超額
+              if (commonTotalPeople > commonTable.capacity) {
+                  console.warn(` -> 警告：第 ${commonTable.id} 桌容量 (${commonTable.capacity}) 已被 [${commonTagName}] Tag 超過 (${commonTotalPeople} 人)`);
+              }
+          }
+      } else {
+          console.warn("警告: 找不到第 1 桌，無法執行 [共同] Tag 的特殊分配規則");
+      }
+
       /* ---------- 0. 特殊規則：銘家人與皺家人安排在第17桌 ---------- */
       const specialTable = tables.find(t => t.id === SPECIAL_TABLE_ID);
       if (specialTable && specialTable.capacity > 0) {
@@ -642,59 +669,74 @@
     // Tag 統計功能
     function renderTagSummary() {
       const tagSummary = document.getElementById('tag-summary');
-      // 如果沒有賓客資料，顯示提示訊息
       if (guests.length === 0) {
         tagSummary.innerHTML = '<p>請先上傳賓客清單</p>';
+        window.tagColors = {};
         return;
       }
-      
-      // 統計每個 Tag 的人數
+
       const tagStats = {};
+      const uniqueTags = new Set();
       guests.forEach(g => {
+        uniqueTags.add(g.tag);
         if (!tagStats[g.tag]) {
           tagStats[g.tag] = { count: 0, people: 0 };
         }
         tagStats[g.tag].count++;
         tagStats[g.tag].people += g.count;
       });
-      
-      // 生成摘要 HTML
-      let html = '<table class="summary-table"><thead><tr><th>Tag</th><th>組數</th><th>人數</th></tr></thead><tbody>';
-      
-      // 使用不同顏色顯示不同 Tag
-      let colorIndex = 0;
-      const tagColors = {};
-      
-      Object.entries(tagStats).forEach(([tag, stat]) => {
-        // 為每個 Tag 分配一個顏色
-        if (!tagColors[tag]) {
-          tagColors[tag] = getTagColor(colorIndex++);
-        }
-        
-        html += `<tr>
-          <td><span style="color: ${tagColors[tag]}">${tag}</span></td>
-          <td>${stat.count}</td>
-          <td>${stat.people}</td>
-        </tr>`;
-      });
-      
-      html += '</tbody></table>';
-      tagSummary.innerHTML = html;
-      
-      // 保存 Tag 顏色映射，供之後使用
-      window.tagColors = tagColors;
-    }
 
-    // 生成 Tag 顏色的函數
-    function getTagColor(index) {
-      // 定義一組互相對比的顏色
-      const colors = [
-        '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', 
+      // --- 顏色分配邏輯 (確保唯一性) ---
+      const predefinedColors = [
+        '#e41a1c', '#377eb8', '#4daf4a', '#984ea3',
         '#ff7f00', '#ffff33', '#a65628', '#f781bf',
         '#3498db', '#e74c3c', '#2ecc71', '#9b59b6',
         '#1abc9c', '#f1c40f', '#34495e', '#7f8c8d'
       ];
-      return colors[index % colors.length];
+      const defaultColor = '#808080';
+      const tagColors = {};
+      const assignedColors = new Set(); // 用來追蹤已分配的顏色值
+      let colorIndex = 0;
+
+      uniqueTags.forEach(tag => {
+          let assignedColor = null;
+          // 從上次停止的地方繼續尋找下一個可用的預定義顏色
+          for (let i = 0; i < predefinedColors.length; i++) {
+              const potentialColor = predefinedColors[colorIndex % predefinedColors.length];
+              if (!assignedColors.has(potentialColor)) {
+                  assignedColor = potentialColor;
+                  tagColors[tag] = assignedColor;
+                  assignedColors.add(assignedColor);
+                  colorIndex++; // 移動到下一個索引供下次使用
+                  break; // 找到唯一顏色，處理下一個 Tag
+              }
+              colorIndex++; // 這個顏色已被使用，嘗試列表中的下一個
+          }
+
+          // 如果所有預定義顏色都已被分配
+          if (!assignedColor) {
+              tagColors[tag] = defaultColor;
+              console.warn(`警告：預定義顏色不足，Tag "${tag}" 被分配了預設灰色。`);
+          }
+      });
+      // --- 顏色分配結束 ---
+
+      // 生成摘要 HTML
+      let html = '<table class="summary-table"><thead><tr><th>Tag</th><th>組數</th><th>人數</th></tr></thead><tbody>';
+      Object.entries(tagStats).sort(([, statA], [, statB]) => statB.people - statA.people)
+        .forEach(([tag, stat]) => {
+          const displayColor = tagColors[tag] || defaultColor;
+          html += `<tr>
+            <td><span style="color: ${displayColor}">${tag}</span></td>
+            <td>${stat.count}</td>
+            <td>${stat.people}</td>
+          </tr>`;
+      });
+
+      html += '</tbody></table>';
+      tagSummary.innerHTML = html;
+
+      window.tagColors = tagColors;
     }
 
     // 顯示分配後的分佈情況
